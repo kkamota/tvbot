@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import datetime
+import logging
 from contextlib import suppress
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from flyerapi import APIError as FlyerAPIError, Flyer
 
 from .config import Settings
 from .database import User, db
@@ -23,7 +30,111 @@ from .keyboards import (
 )
 from .middlewares import mask_sensitive
 
+logger = logging.getLogger(__name__)
+
 router = Router()
+
+
+_FLYER_INCOMPLETE_STATUSES = {"incomplete", "abort"}
+
+
+def _map_button_text(
+    task: dict,
+    index: int,
+    button_labels: dict[str, str] | None,
+) -> str:
+    task_name = str(task.get("task", "")).strip().lower()
+    if not task_name:
+        return "Перейти"
+
+    labels = button_labels or {}
+    if (
+        task_name == "give boost"
+        and len(task.get("links", [])) == 2
+        and index == 0
+        and "subscribe channel" in labels
+    ):
+        return labels["subscribe channel"]
+
+    if task_name in labels:
+        return labels[task_name]
+
+    return task.get("title") or task.get("button") or task_name.title()
+
+
+def _build_flyer_keyboard(
+    tasks: list[dict],
+    settings: Settings,
+) -> InlineKeyboardMarkup:
+    per_row = max(1, settings.flyer_buttons_per_row)
+    button_labels = None
+    if settings.flyer_button_labels is not None:
+        button_labels = dict(settings.flyer_button_labels)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for task in tasks:
+        links = task.get("links") or []
+        for index, link in enumerate(links):
+            text = _map_button_text(task, index, button_labels)
+            current_row.append(InlineKeyboardButton(text=text, url=str(link)))
+            if len(current_row) >= per_row:
+                rows.append(current_row)
+                current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=settings.flyer_verify_button_text,
+                callback_data="flyer_check_subscription",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _prompt_flyer_tasks(
+    source_message: Message,
+    flyer: Flyer,
+    settings: Settings,
+    user_id: int,
+    language_code: Optional[str],
+    edit: bool = False,
+) -> bool:
+    try:
+        tasks = await flyer.get_tasks(
+            user_id=user_id,
+            language_code=language_code or settings.flyer_language_code,
+            limit=settings.flyer_tasks_limit,
+        )
+    except FlyerAPIError as exc:
+        logger.warning("Flyer API returned an error when fetching tasks: %s", exc)
+        return False
+    incomplete = [
+        task
+        for task in tasks
+        if str(task.get("status", "")).lower() in _FLYER_INCOMPLETE_STATUSES
+    ]
+    if not incomplete:
+        return False
+
+    markup = _build_flyer_keyboard(incomplete, settings)
+    text = settings.flyer_tasks_message or (
+        "Чтобы получить доступ к функциям бота, необходимо подписаться на ресурсы."
+    )
+
+    if edit:
+        try:
+            await source_message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await source_message.answer(text, reply_markup=markup)
+    else:
+        await source_message.answer(text, reply_markup=markup)
+    return True
 
 
 class WithdrawStates(StatesGroup):
@@ -104,8 +215,33 @@ async def _update_admin_controls(
         pass
 
 
-async def _is_channel_member(bot: Bot, settings: Settings, telegram_id: int) -> bool:
-    member = await bot.get_chat_member(settings.channel_username, telegram_id)
+async def _has_required_subscription(
+    bot: Bot,
+    settings: Settings,
+    telegram_id: int,
+    flyer: Optional[Flyer],
+    language_code: Optional[str],
+) -> bool:
+    if flyer is not None:
+        try:
+            result = await flyer.check(
+                telegram_id,
+                language_code=language_code or settings.flyer_language_code,
+                message=settings.flyer_check_message or {},
+            )
+        except FlyerAPIError as exc:
+            logger.warning("Flyer API returned an error during check: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Unexpected error during Flyer API check: %s", exc)
+        else:
+            return bool(result)
+
+    try:
+        member = await bot.get_chat_member(settings.channel_username, telegram_id)
+    except TelegramBadRequest as exc:
+        logger.warning("Failed to verify channel membership via Telegram API: %s", exc)
+        return False
+
     return member.status in {
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
@@ -172,9 +308,15 @@ async def _handle_unsubscription(user: User, bot: Bot, settings: Settings) -> No
 
 
 async def _verify_and_activate_subscription(
-    bot: Bot, settings: Settings, user: User
+    bot: Bot,
+    settings: Settings,
+    user: User,
+    flyer: Optional[Flyer],
+    language_code: Optional[str],
 ) -> tuple[bool, bool, bool]:
-    is_member = await _is_channel_member(bot, settings, user.telegram_id)
+    is_member = await _has_required_subscription(
+        bot, settings, user.telegram_id, flyer, language_code
+    )
     if not is_member:
         if user.is_subscribed:
             await _handle_unsubscription(user, bot, settings)
@@ -186,16 +328,35 @@ async def _verify_and_activate_subscription(
 
 
 async def ensure_subscription_access(
-    message: Message, bot: Bot, settings: Settings, user: User
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    user: User,
+    flyer: Optional[Flyer],
 ) -> bool:
+    language_code = message.from_user.language_code if message.from_user else None
     is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
-        bot, settings, user
+        bot, settings, user, flyer, language_code
     )
     if not is_member:
-        await message.answer(
-            "Бот доступен только после подписки на канал.",
-            reply_markup=subscribe_keyboard(settings.channel_username),
-        )
+        if flyer and await _prompt_flyer_tasks(
+            message,
+            flyer,
+            settings,
+            message.from_user.id,
+            language_code,
+        ):
+            return False
+
+        if flyer:
+            await message.answer(
+                "Бот доступен только после выполнения обязательных подписок.",
+            )
+        else:
+            await message.answer(
+                "Бот доступен только после подписки на канал.",
+                reply_markup=subscribe_keyboard(settings.channel_username),
+            )
         return False
     if activated:
         thanks_message = "Спасибо за подписку! Теперь бот доступен полностью."
@@ -206,7 +367,13 @@ async def ensure_subscription_access(
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings: Settings) -> None:
+async def cmd_start(
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    settings: Settings,
+    flyer: Optional[Flyer],
+) -> None:
     telegram_id = message.from_user.id
     args = command.args or ""
     referred_by: Optional[int] = None
@@ -238,14 +405,28 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
     else:
         await message.answer("С возвращением!", reply_markup=main_menu_keyboard())
 
+    language_code = message.from_user.language_code if message.from_user else None
     is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
-        bot, settings, user
+        bot, settings, user, flyer, language_code
     )
     if not is_member:
-        await message.answer(
-            "Поделитесь ботом с друзьями и зарабатывайте звезды!",
-            reply_markup=subscribe_keyboard(settings.channel_username),
-        )
+        if flyer and await _prompt_flyer_tasks(
+            message,
+            flyer,
+            settings,
+            telegram_id,
+            language_code,
+        ):
+            pass
+        elif flyer:
+            await message.answer(
+                "Выполните обязательные подписки, затем нажмите кнопку «☑️ Проверить».",
+            )
+        else:
+            await message.answer(
+                "Поделитесь ботом с друзьями и зарабатывайте звезды!",
+                reply_markup=subscribe_keyboard(settings.channel_username),
+            )
     elif activated:
         message_text = "Спасибо за подписку! Теперь бот доступен полностью."
         if start_bonus_awarded:
@@ -262,21 +443,31 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
 
 
 @router.message(F.text == "💰 Баланс")
-async def show_balance(message: Message, settings: Settings, bot: Bot) -> None:
+async def show_balance(
+    message: Message,
+    settings: Settings,
+    bot: Bot,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         return
     await message.answer(f"На вашем балансе {user.balance} ⭐")
 
 
 @router.message(F.text == "🎁 Ежедневный бонус")
-async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
+async def daily_bonus(
+    message: Message,
+    settings: Settings,
+    bot: Bot,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         return
     now = datetime.datetime.utcnow()
     last_bonus = None
@@ -300,11 +491,16 @@ async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
 
 
 @router.message(F.text == "👥 Реферальная ссылка")
-async def referral_link(message: Message, bot: Bot, settings: Settings) -> None:
+async def referral_link(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         return
     bot_info = await bot.get_me()
     await message.answer(
@@ -316,11 +512,16 @@ async def referral_link(message: Message, bot: Bot, settings: Settings) -> None:
 
 
 @router.message(F.text == "🏆 Топ приглашений")
-async def top_referrers(message: Message, settings: Settings, bot: Bot) -> None:
+async def top_referrers(
+    message: Message,
+    settings: Settings,
+    bot: Bot,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         return
     top = await db.list_top_referrers()
     if not top:
@@ -334,18 +535,38 @@ async def top_referrers(message: Message, settings: Settings, bot: Bot) -> None:
 
 
 @router.message(F.text == "✅ Проверить подписку")
-async def check_subscription(message: Message, bot: Bot, settings: Settings) -> None:
+async def check_subscription(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
+    language_code = message.from_user.language_code if message.from_user else None
     is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
-        bot, settings, user
+        bot, settings, user, flyer, language_code
     )
     if not is_member:
-        await message.answer(
-            "Пожалуйста, подпишитесь на канал, чтобы получать награды.",
-            reply_markup=subscribe_keyboard(settings.channel_username),
-        )
+        if flyer and await _prompt_flyer_tasks(
+            message,
+            flyer,
+            settings,
+            message.from_user.id,
+            language_code,
+        ):
+            return
+
+        if flyer:
+            await message.answer(
+                "Пожалуйста, выполните все обязательные подписки и повторите проверку.",
+            )
+        else:
+            await message.answer(
+                "Пожалуйста, подпишитесь на канал, чтобы получать награды.",
+                reply_markup=subscribe_keyboard(settings.channel_username),
+            )
         return
 
     if activated:
@@ -361,7 +582,10 @@ async def check_subscription(message: Message, bot: Bot, settings: Settings) -> 
 
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(
-    callback: CallbackQuery, bot: Bot, settings: Settings
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    flyer: Optional[Flyer],
 ) -> None:
     user, _ = await _ensure_user_record(
         callback.from_user.id,
@@ -375,19 +599,33 @@ async def check_subscription_callback(
                 "Ваш аккаунт заблокирован. Свяжитесь с поддержкой для разблокировки."
             )
         return
+    language_code = callback.from_user.language_code
     is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
-        bot, settings, user
+        bot, settings, user, flyer, language_code
     )
     if not is_member:
         await callback.answer(
-            "Подпишитесь на канал, чтобы продолжить.",
+            "Подписки не найдены. Выполните задания и повторите проверку.",
             show_alert=True,
         )
-        await callback.message.answer(
-            "Пожалуйста, подпишитесь на канал, чтобы получать награды.",
-            reply_markup=subscribe_keyboard(settings.channel_username),
-        )
+        if flyer and callback.message:
+            if await _prompt_flyer_tasks(
+                callback.message,
+                flyer,
+                settings,
+                callback.from_user.id,
+                language_code,
+                edit=True,
+            ):
+                return
+        if callback.message:
+            await callback.message.answer(
+                "Пожалуйста, подпишитесь на канал, чтобы получать награды.",
+                reply_markup=subscribe_keyboard(settings.channel_username),
+            )
         return
+
+    await callback.answer("Готово!")
 
     if activated:
         response = "Спасибо за подписку! Награды активированы."
@@ -398,16 +636,84 @@ async def check_subscription_callback(
     else:
         response = "Подписка уже подтверждена."
 
-    await callback.message.answer(response)
+    if callback.message:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup()
+        await callback.message.answer(response)
+
+
+@router.callback_query(F.data == "flyer_check_subscription")
+async def flyer_check_subscription_callback(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    flyer: Optional[Flyer],
+) -> None:
+    if flyer is None:
+        await callback.answer("Проверка недоступна.", show_alert=True)
+        return
+
+    user, _ = await _ensure_user_record(
+        callback.from_user.id,
+        settings,
+        callback.from_user.username,
+    )
+    if user.is_banned:
+        await callback.answer("Пользователь заблокирован", show_alert=True)
+        with suppress(TelegramBadRequest):
+            if callback.message:
+                await callback.message.answer(
+                    "Ваш аккаунт заблокирован. Свяжитесь с поддержкой для разблокировки.",
+                )
+        return
+
+    language_code = callback.from_user.language_code
+    is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
+        bot, settings, user, flyer, language_code
+    )
+    if not is_member:
+        if callback.message:
+            await _prompt_flyer_tasks(
+                callback.message,
+                flyer,
+                settings,
+                callback.from_user.id,
+                language_code,
+                edit=True,
+            )
+        await callback.answer("Подписки еще не выполнены.", show_alert=True)
+        return
+
     await callback.answer("Готово!")
+
+    if activated:
+        response = "Спасибо за подписку! Награды активированы."
+        if start_bonus_awarded:
+            response += f" Вам начислено {settings.start_bonus} ⭐ стартового бонуса."
+        if user.referred_by and user.reward_claimed:
+            response += f" Вашему другу начислено {settings.referral_bonus} ⭐ за приглашение."
+    else:
+        response = "Подписка уже подтверждена."
+
+    if callback.message:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup()
+        await callback.message.answer(response)
+
 
 
 @router.message(F.text == "💳 Вывод средств")
-async def withdrawal_request(message: Message, settings: Settings, bot: Bot, state: FSMContext) -> None:
+async def withdrawal_request(
+    message: Message,
+    settings: Settings,
+    bot: Bot,
+    state: FSMContext,
+    flyer: Optional[Flyer],
+) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         return
     referrals = await db.list_referrals(user.telegram_id)
     if referrals:
@@ -436,13 +742,17 @@ async def withdrawal_request(message: Message, settings: Settings, bot: Bot, sta
 
 @router.message(WithdrawStates.waiting_for_amount)
 async def process_withdraw_amount(
-    message: Message, settings: Settings, bot: Bot, state: FSMContext
+    message: Message,
+    settings: Settings,
+    bot: Bot,
+    state: FSMContext,
+    flyer: Optional[Flyer],
 ) -> None:
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         await state.clear()
         return
-    if not await ensure_subscription_access(message, bot, settings, user):
+    if not await ensure_subscription_access(message, bot, settings, user, flyer):
         await state.clear()
         return
     try:
