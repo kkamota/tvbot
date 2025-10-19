@@ -369,8 +369,29 @@ async def admin_withdrawals(callback: CallbackQuery, settings: Settings) -> None
         await callback.answer("Нет ожидающих заявок", show_alert=True)
         return
     for request in requests:
+        user = await db.get_user(request.telegram_id)
+        if user and user.username:
+            user_line = f"@{user.username} (ID {user.telegram_id})"
+        else:
+            user_line = f"ID {request.telegram_id}"
+
+        referrals = await db.list_referrals(request.telegram_id)
+        if referrals:
+            referrals_lines = "\n".join(
+                f"• @{username}" if username else f"• ID {ref_id}"
+                for ref_id, username in referrals
+            )
+            referrals_block = f"\nПриглашенные друзья:\n{referrals_lines}"
+        else:
+            referrals_block = "\nПриглашенные друзья: нет"
+
         await callback.message.answer(
-            f"Заявка #{request.id}\nПользователь: {request.telegram_id}\nСумма: {request.amount} ⭐\nСоздана: {request.created_at}",
+            (
+                f"Заявка #{request.id}\n"
+                f"Пользователь: {user_line}\n"
+                f"Сумма: {request.amount} ⭐\n"
+                f"Создана: {request.created_at}{referrals_block}"
+            ),
             reply_markup=withdrawal_actions_keyboard(request.id),
         )
     await callback.answer()
