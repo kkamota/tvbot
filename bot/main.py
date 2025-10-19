@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from flyerapi import Flyer
 
 from .config import Settings, load_settings
 from .database import db
@@ -26,7 +27,8 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
-    dp.workflow_data.update(settings=settings)
+    flyer_client = Flyer(settings.flyer_api_key) if settings.flyer_api_key else None
+    dp.workflow_data.update(settings=settings, flyer=flyer_client)
 
     dp.message.middleware(ThrottlingMiddleware(rate_limit=0.5))
 
