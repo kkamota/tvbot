@@ -18,6 +18,7 @@ class User:
     is_subscribed: bool
     reward_claimed: bool
     last_daily_bonus: Optional[str]
+    username: Optional[str]
 
 
 @dataclass(slots=True)
@@ -43,10 +44,12 @@ class Database:
                 referred_by INTEGER,
                 is_subscribed INTEGER NOT NULL DEFAULT 0,
                 reward_claimed INTEGER NOT NULL DEFAULT 0,
-                last_daily_bonus TEXT
+                last_daily_bonus TEXT,
+                username TEXT
             );
             """
         )
+        await self._ensure_column("users", "username", "TEXT")
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals (
@@ -61,7 +64,7 @@ class Database:
 
     async def get_user(self, telegram_id: int) -> Optional[User]:
         row = await self._fetchone(
-            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if row is None:
@@ -73,6 +76,7 @@ class Database:
             is_subscribed=bool(row[3]),
             reward_claimed=bool(row[4]),
             last_daily_bonus=row[5],
+            username=row[6],
         )
 
     async def create_user(
@@ -80,16 +84,23 @@ class Database:
         telegram_id: int,
         initial_balance: int,
         referred_by: Optional[int],
+        username: Optional[str],
     ) -> None:
         await self._execute(
-            "INSERT OR IGNORE INTO users (telegram_id, balance, referred_by) VALUES (?, ?, ?)",
-            (telegram_id, initial_balance, referred_by),
+            "INSERT OR IGNORE INTO users (telegram_id, balance, referred_by, username) VALUES (?, ?, ?, ?)",
+            (telegram_id, initial_balance, referred_by, username),
         )
 
     async def assign_referrer(self, telegram_id: int, referred_by: Optional[int]) -> None:
         await self._execute(
             "UPDATE users SET referred_by = ? WHERE telegram_id = ? AND referred_by IS NULL",
             (referred_by, telegram_id),
+        )
+
+    async def update_username(self, telegram_id: int, username: Optional[str]) -> None:
+        await self._execute(
+            "UPDATE users SET username = ? WHERE telegram_id = ?",
+            (username, telegram_id),
         )
 
     async def update_balance(self, telegram_id: int, delta: int) -> None:
@@ -135,6 +146,13 @@ class Database:
             "INSERT INTO withdrawals (telegram_id, amount) VALUES (?, ?)",
             (telegram_id, amount),
         )
+
+    async def list_referrals(self, telegram_id: int) -> list[tuple[int, Optional[str]]]:
+        rows = await self._fetchall(
+            "SELECT telegram_id, username FROM users WHERE referred_by = ? ORDER BY telegram_id",
+            (telegram_id,),
+        )
+        return [(row[0], row[1]) for row in rows]
 
     async def list_withdrawals(self, status: Optional[str] = None) -> list[WithdrawalRequest]:
         if status:
@@ -185,6 +203,11 @@ class Database:
             cursor = conn.execute(query, tuple(params) if params else ())
             rows = cursor.fetchall()
             return rows
+
+    async def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = await self._fetchall(f"PRAGMA table_info({table})")
+        if not any(row[1] == column for row in columns):
+            await self._execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @asynccontextmanager
     async def _locked_connection(self):
