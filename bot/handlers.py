@@ -18,6 +18,7 @@ from .keyboards import (
     admin_menu_keyboard,
     main_menu_keyboard,
     subscribe_keyboard,
+    support_admin_keyboard,
     withdrawal_actions_keyboard,
 )
 from .middlewares import mask_sensitive
@@ -31,6 +32,14 @@ class WithdrawStates(StatesGroup):
 
 class AdminBroadcastStates(StatesGroup):
     waiting_for_message = State()
+
+
+class SupportStates(StatesGroup):
+    waiting_for_message = State()
+
+
+class AdminReplyStates(StatesGroup):
+    waiting_for_reply = State()
 
 
 async def _ensure_user_record(
@@ -66,6 +75,33 @@ async def ensure_user(message: Message, settings: Settings) -> User:
         message.from_user.username,
     )
     return user
+
+
+async def ensure_not_banned(message: Message, user: User) -> bool:
+    if user.is_banned:
+        await message.answer(
+            "Ваш аккаунт заблокирован. Свяжитесь с поддержкой для разблокировки."
+        )
+        return False
+    return True
+
+
+async def _update_admin_controls(
+    callback: CallbackQuery, user_id: int, is_banned: bool, request_id: Optional[int]
+) -> None:
+    try:
+        if request_id is not None:
+            await callback.message.edit_reply_markup(
+                reply_markup=withdrawal_actions_keyboard(
+                    request_id, user_id, is_banned
+                )
+            )
+        else:
+            await callback.message.edit_reply_markup(
+                reply_markup=support_admin_keyboard(user_id, is_banned)
+            )
+    except TelegramBadRequest:
+        pass
 
 
 async def _is_channel_member(bot: Bot, settings: Settings, telegram_id: int) -> bool:
@@ -139,6 +175,12 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
         message.from_user.username,
         referred_by,
     )
+    if user.is_banned:
+        await message.answer(
+            "Ваш аккаунт заблокирован. Свяжитесь с поддержкой, чтобы восстановить доступ.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
     if created:
         await message.answer(
             "Добро пожаловать! На ваш баланс начислено 3 ⭐ за регистрацию.",
@@ -168,6 +210,8 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
 @router.message(F.text == "💰 Баланс")
 async def show_balance(message: Message, settings: Settings, bot: Bot) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
     await message.answer(f"На вашем балансе {user.balance} ⭐")
@@ -176,6 +220,8 @@ async def show_balance(message: Message, settings: Settings, bot: Bot) -> None:
 @router.message(F.text == "🎁 Ежедневный бонус")
 async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
     now = datetime.datetime.utcnow()
@@ -202,6 +248,8 @@ async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
 @router.message(F.text == "👥 Реферальная ссылка")
 async def referral_link(message: Message, bot: Bot, settings: Settings) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
     bot_info = await bot.get_me()
@@ -216,6 +264,8 @@ async def referral_link(message: Message, bot: Bot, settings: Settings) -> None:
 @router.message(F.text == "🏆 Топ приглашений")
 async def top_referrers(message: Message, settings: Settings, bot: Bot) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
     top = await db.list_top_referrers()
@@ -232,6 +282,8 @@ async def top_referrers(message: Message, settings: Settings, bot: Bot) -> None:
 @router.message(F.text == "✅ Проверить подписку")
 async def check_subscription(message: Message, bot: Bot, settings: Settings) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
     if not is_member:
         await message.answer(
@@ -258,6 +310,13 @@ async def check_subscription_callback(
         settings,
         callback.from_user.username,
     )
+    if user.is_banned:
+        await callback.answer("Пользователь заблокирован", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await callback.message.answer(
+                "Ваш аккаунт заблокирован. Свяжитесь с поддержкой для разблокировки."
+            )
+        return
     is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
     if not is_member:
         await callback.answer(
@@ -284,6 +343,8 @@ async def check_subscription_callback(
 @router.message(F.text == "💳 Вывод средств")
 async def withdrawal_request(message: Message, settings: Settings, bot: Bot, state: FSMContext) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
     referrals = await db.list_referrals(user.telegram_id)
@@ -316,6 +377,9 @@ async def process_withdraw_amount(
     message: Message, settings: Settings, bot: Bot, state: FSMContext
 ) -> None:
     user = await ensure_user(message, settings)
+    if not await ensure_not_banned(message, user):
+        await state.clear()
+        return
     if not await ensure_subscription_access(message, bot, settings, user):
         await state.clear()
         return
@@ -341,6 +405,205 @@ async def process_withdraw_amount(
     await message.answer(
         "Заявка на вывод создана. Администратор свяжется с вами в ближайшее время."
     )
+
+
+@router.message(F.text == "🆘 Поддержка")
+async def support_entry(message: Message, settings: Settings, state: FSMContext) -> None:
+    await ensure_user(message, settings)
+    await state.clear()
+    await state.set_state(SupportStates.waiting_for_message)
+    await message.answer(
+        "Опишите вашу проблему одним сообщением. Для отмены отправьте /cancel или 'отмена'."
+    )
+
+
+@router.message(SupportStates.waiting_for_message)
+async def support_message(
+    message: Message, settings: Settings, state: FSMContext, bot: Bot
+) -> None:
+    user = await ensure_user(message, settings)
+    text = message.text or message.caption or ""
+    if text.strip().lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Обращение отменено.")
+        return
+
+    if not text.strip():
+        await message.answer("Пожалуйста, отправьте текстовое сообщение.")
+        return
+
+    await state.clear()
+
+    display = f"@{user.username}" if user.username else f"ID {user.telegram_id}"
+    status_line = "заблокирован" if user.is_banned else "активен"
+    support_text = (
+        "Новое обращение в поддержку\n"
+        f"От: {display} (ID {user.telegram_id})\n"
+        f"Статус: {status_line}\n\n"
+        f"{text}"
+    )
+
+    notified = False
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                support_text,
+                reply_markup=support_admin_keyboard(user.telegram_id, user.is_banned),
+            )
+            notified = True
+        except (TelegramBadRequest, TelegramForbiddenError):
+            continue
+
+    if notified:
+        await message.answer(
+            "Ваше обращение отправлено администрации. Ожидайте ответа в этом чате."
+        )
+    else:
+        await message.answer(
+            "Не удалось доставить сообщение администраторам. Попробуйте позже."
+        )
+
+
+@router.callback_query(F.data.startswith("support_reply"))
+async def support_reply_start(
+    callback: CallbackQuery, settings: Settings, state: FSMContext
+) -> None:
+    if callback.from_user.id not in settings.admin_ids:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    _, user_id_raw = callback.data.split(":", 1)
+    target_id = int(user_id_raw)
+    await state.clear()
+    await state.set_state(AdminReplyStates.waiting_for_reply)
+    await state.update_data(reply_target=target_id)
+    await callback.message.answer(
+        (
+            "Введите ответ для пользователя ID {user_id}.\n"
+            "Для отмены отправьте /cancel или 'отмена'."
+        ).format(user_id=target_id),
+        reply_markup=admin_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminReplyStates.waiting_for_reply)
+async def support_reply_send(
+    message: Message, settings: Settings, state: FSMContext, bot: Bot
+) -> None:
+    if message.from_user.id not in settings.admin_ids:
+        await message.answer("Доступ запрещен.")
+        return
+
+    text = message.text or message.caption or ""
+    if text.strip().lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Ответ отменен.", reply_markup=admin_menu_keyboard())
+        return
+
+    data = await state.get_data()
+    target_id = data.get("reply_target")
+    if not target_id:
+        await state.clear()
+        await message.answer(
+            "Не удалось определить адресата сообщения.",
+            reply_markup=admin_menu_keyboard(),
+        )
+        return
+
+    if not text.strip():
+        await message.answer("Пожалуйста, отправьте текст ответа или /cancel.")
+        return
+
+    admin_name = (
+        f"@{message.from_user.username}" if message.from_user.username else "Администратор"
+    )
+    reply_text = (
+        "Сообщение от поддержки:\n"
+        f"{text}\n\n"
+        f"Ответил: {admin_name}"
+    )
+
+    try:
+        await bot.send_message(target_id, reply_text)
+    except TelegramForbiddenError:
+        await message.answer(
+            "Не удалось отправить сообщение: пользователь заблокировал бота.",
+            reply_markup=admin_menu_keyboard(),
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить сообщение. Попробуйте изменить текст.",
+            reply_markup=admin_menu_keyboard(),
+        )
+    else:
+        await message.answer(
+            "Ответ отправлен пользователю.", reply_markup=admin_menu_keyboard()
+        )
+    finally:
+        await state.clear()
+
+
+def _parse_target_payload(payload: str) -> tuple[int, Optional[int]]:
+    parts = payload.split(":")
+    user_id = int(parts[1])
+    request_id: Optional[int] = None
+    if len(parts) > 2 and parts[2].isdigit():
+        request_id = int(parts[2])
+    return user_id, request_id
+
+
+async def _set_ban_status(
+    bot: Bot, user_id: int, banned: bool
+) -> Optional[User]:
+    user = await db.get_user(user_id)
+    if user is None:
+        return None
+    if user.is_banned == banned:
+        return user
+    await db.set_ban_status(user_id, banned)
+    user.is_banned = banned
+    notify_text = (
+        "Ваш аккаунт заблокирован. Свяжитесь с поддержкой, чтобы узнать подробности."
+        if banned
+        else "Ваш аккаунт разблокирован. Вы снова можете пользоваться ботом."
+    )
+    with suppress(TelegramBadRequest, TelegramForbiddenError):
+        await bot.send_message(user_id, notify_text)
+    return user
+
+
+@router.callback_query(F.data.startswith("block_user"))
+async def block_user_callback(callback: CallbackQuery, settings: Settings) -> None:
+    if callback.from_user.id not in settings.admin_ids:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    user_id, request_id = _parse_target_payload(callback.data)
+    user = await _set_ban_status(callback.bot, user_id, True)
+    if user is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    await _update_admin_controls(callback, user_id, True, request_id)
+    await callback.answer("Пользователь заблокирован")
+
+
+@router.callback_query(F.data.startswith("unblock_user"))
+async def unblock_user_callback(callback: CallbackQuery, settings: Settings) -> None:
+    if callback.from_user.id not in settings.admin_ids:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    user_id, request_id = _parse_target_payload(callback.data)
+    user = await _set_ban_status(callback.bot, user_id, False)
+    if user is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    await _update_admin_controls(callback, user_id, False, request_id)
+    await callback.answer("Пользователь разблокирован")
 
 
 @router.message(Command("admin"))
@@ -394,14 +657,21 @@ async def admin_withdrawals(callback: CallbackQuery, settings: Settings) -> None
         else:
             referrals_block = "\nПриглашенные друзья: нет"
 
+        status_line = "Заблокирован" if (user and user.is_banned) else "Активен"
+
         await callback.message.answer(
             (
                 f"Заявка #{request.id}\n"
                 f"Пользователь: {user_line}\n"
                 f"Сумма: {request.amount} ⭐\n"
-                f"Создана: {request.created_at}{referrals_block}"
+                f"Создана: {request.created_at}\n"
+                f"Статус пользователя: {status_line}{referrals_block}"
             ),
-            reply_markup=withdrawal_actions_keyboard(request.id),
+            reply_markup=withdrawal_actions_keyboard(
+                request.id,
+                request.telegram_id,
+                bool(user and user.is_banned),
+            ),
         )
     await callback.answer()
 

@@ -19,6 +19,7 @@ class User:
     reward_claimed: bool
     last_daily_bonus: Optional[str]
     username: Optional[str]
+    is_banned: bool
 
 
 @dataclass(slots=True)
@@ -45,11 +46,13 @@ class Database:
                 is_subscribed INTEGER NOT NULL DEFAULT 0,
                 reward_claimed INTEGER NOT NULL DEFAULT 0,
                 last_daily_bonus TEXT,
-                username TEXT
+                username TEXT,
+                is_banned INTEGER NOT NULL DEFAULT 0
             );
             """
         )
         await self._ensure_column("users", "username", "TEXT")
+        await self._ensure_column("users", "is_banned", "INTEGER NOT NULL DEFAULT 0")
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals (
@@ -64,7 +67,7 @@ class Database:
 
     async def get_user(self, telegram_id: int) -> Optional[User]:
         row = await self._fetchone(
-            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username, is_banned FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if row is None:
@@ -77,6 +80,7 @@ class Database:
             reward_claimed=bool(row[4]),
             last_daily_bonus=row[5],
             username=row[6],
+            is_banned=bool(row[7]),
         )
 
     async def create_user(
@@ -197,7 +201,7 @@ class Database:
     async def list_all_users(self) -> list[User]:
         rows = await self._fetchall(
             """
-            SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username
+            SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username, is_banned
             FROM users
             ORDER BY telegram_id
             """,
@@ -211,9 +215,16 @@ class Database:
                 reward_claimed=bool(row[4]),
                 last_daily_bonus=row[5],
                 username=row[6],
+                is_banned=bool(row[7]),
             )
             for row in rows
         ]
+
+    async def set_ban_status(self, telegram_id: int, banned: bool) -> None:
+        await self._execute(
+            "UPDATE users SET is_banned = ? WHERE telegram_id = ?",
+            (int(banned), telegram_id),
+        )
 
     async def count_users(self) -> int:
         row = await self._fetchone("SELECT COUNT(*) FROM users")

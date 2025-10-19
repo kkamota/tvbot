@@ -7,6 +7,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🎁 Ежедневный бонус")],
             [KeyboardButton(text="👥 Реферальная ссылка"), KeyboardButton(text="🏆 Топ приглашений")],
             [KeyboardButton(text="💳 Вывод средств"), KeyboardButton(text="✅ Проверить подписку")],
+            [KeyboardButton(text="🆘 Поддержка")],
         ],
         resize_keyboard=True,
     )
@@ -32,12 +33,42 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def withdrawal_actions_keyboard(request_id: int) -> InlineKeyboardMarkup:
+def withdrawal_actions_keyboard(
+    request_id: int,
+    user_id: int,
+    is_banned: bool,
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Выплачено", callback_data=f"withdraw_paid:{request_id}"),
                 InlineKeyboardButton(text="❌ Отклонено", callback_data=f"withdraw_rejected:{request_id}"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚫 Разблокировать" if is_banned else "🚫 Заблокировать",
+                    callback_data=(
+                        f"unblock_user:{user_id}:{request_id}"
+                        if is_banned
+                        else f"block_user:{user_id}:{request_id}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def support_admin_keyboard(user_id: int, is_banned: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"support_reply:{user_id}")],
+            [
+                InlineKeyboardButton(
+                    text="🚫 Разблокировать" if is_banned else "🚫 Заблокировать",
+                    callback_data=(
+                        f"unblock_user:{user_id}" if is_banned else f"block_user:{user_id}"
+                    ),
+                )
+            ],
         ]
     )
