@@ -9,7 +9,7 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery, Message
 
 from .config import Settings
@@ -27,6 +27,10 @@ router = Router()
 
 class WithdrawStates(StatesGroup):
     waiting_for_amount = State()
+
+
+class AdminBroadcastStates(StatesGroup):
+    waiting_for_message = State()
 
 
 async def _ensure_user_record(
@@ -397,13 +401,42 @@ async def admin_withdrawals(callback: CallbackQuery, settings: Settings) -> None
     await callback.answer()
 
 
-async def _update_withdrawal_status(callback: CallbackQuery, status: str) -> None:
+async def _update_withdrawal_status(callback: CallbackQuery, status: str, bot: Bot) -> None:
     _, raw_id = callback.data.split(":", 1)
     request_id = int(raw_id)
+    request = await db.get_withdrawal(request_id)
+    if request is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+
     await db.set_withdrawal_status(request_id, status)
-    await callback.message.edit_text(
-        callback.message.text + f"\nСтатус обновлен: {status}",
-    )
+
+    status_label = {
+        "paid": "Выплачено",
+        "rejected": "Отклонено",
+    }.get(status, status)
+
+    try:
+        await callback.message.edit_text(
+            callback.message.text + f"\nСтатус обновлен: {status_label}",
+        )
+    except TelegramBadRequest:
+        pass
+
+    user_message = {
+        "paid": "✅ Ваша заявка на вывод выплачена.",
+        "rejected": "❌ Ваша заявка на вывод отклонена. Свяжитесь с поддержкой для уточнения деталей.",
+    }.get(status, f"Статус вашей заявки изменен: {status_label}.")
+
+    with suppress(TelegramBadRequest, TelegramForbiddenError):
+        await bot.send_message(
+            request.telegram_id,
+            (
+                f"Заявка #{request.id} на вывод {request.amount} ⭐:\n"
+                f"{user_message}"
+            ),
+        )
+
     await callback.answer("Статус обновлен")
 
 
@@ -412,7 +445,7 @@ async def withdrawal_paid(callback: CallbackQuery, settings: Settings) -> None:
     if callback.from_user.id not in settings.admin_ids:
         await callback.answer("Доступ запрещен", show_alert=True)
         return
-    await _update_withdrawal_status(callback, "paid")
+    await _update_withdrawal_status(callback, "paid", callback.bot)
 
 
 @router.callback_query(F.data.startswith("withdraw_rejected"))
@@ -420,7 +453,58 @@ async def withdrawal_rejected(callback: CallbackQuery, settings: Settings) -> No
     if callback.from_user.id not in settings.admin_ids:
         await callback.answer("Доступ запрещен", show_alert=True)
         return
-    await _update_withdrawal_status(callback, "rejected")
+    await _update_withdrawal_status(callback, "rejected", callback.bot)
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if callback.from_user.id not in settings.admin_ids:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminBroadcastStates.waiting_for_message)
+    await callback.message.edit_text(
+        "Отправьте текст сообщения, которое нужно разослать всем пользователям.\n"
+        "Для отмены введите /cancel.",
+        reply_markup=admin_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminBroadcastStates.waiting_for_message)
+async def admin_broadcast_send(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if message.from_user.id not in settings.admin_ids:
+        await message.answer("Доступ запрещен.")
+        return
+
+    text = message.text or ""
+    if text.strip().lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=admin_menu_keyboard())
+        return
+
+    users = await db.list_all_users()
+    sent = 0
+    for user in users:
+        try:
+            await message.send_copy(user.telegram_id)
+            sent += 1
+        except (TelegramBadRequest, TelegramForbiddenError):
+            continue
+
+    await state.clear()
+    await message.answer(
+        f"Рассылка отправлена {sent} пользователям.",
+        reply_markup=admin_menu_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "admin_regen_pin")

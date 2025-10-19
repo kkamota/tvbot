@@ -173,11 +173,47 @@ class Database:
             for row in rows
         ]
 
+    async def get_withdrawal(self, request_id: int) -> Optional[WithdrawalRequest]:
+        row = await self._fetchone(
+            "SELECT id, telegram_id, amount, status, created_at FROM withdrawals WHERE id = ?",
+            (request_id,),
+        )
+        if row is None:
+            return None
+        return WithdrawalRequest(
+            id=row[0],
+            telegram_id=row[1],
+            amount=row[2],
+            status=row[3],
+            created_at=row[4],
+        )
+
     async def set_withdrawal_status(self, request_id: int, status: str) -> None:
         await self._execute(
             "UPDATE withdrawals SET status = ? WHERE id = ?",
             (status, request_id),
         )
+
+    async def list_all_users(self) -> list[User]:
+        rows = await self._fetchall(
+            """
+            SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username
+            FROM users
+            ORDER BY telegram_id
+            """,
+        )
+        return [
+            User(
+                telegram_id=row[0],
+                balance=row[1],
+                referred_by=row[2],
+                is_subscribed=bool(row[3]),
+                reward_claimed=bool(row[4]),
+                last_daily_bonus=row[5],
+                username=row[6],
+            )
+            for row in rows
+        ]
 
     async def count_users(self) -> int:
         row = await self._fetchone("SELECT COUNT(*) FROM users")

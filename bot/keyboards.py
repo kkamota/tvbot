@@ -26,6 +26,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
             [InlineKeyboardButton(text="📜 Запросы на вывод", callback_data="admin_withdrawals")],
+            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔐 Перегенерировать защитный PIN", callback_data="admin_regen_pin")],
         ]
     )
