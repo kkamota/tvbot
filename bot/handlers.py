@@ -147,11 +147,16 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
     else:
         await message.answer("С возвращением!", reply_markup=main_menu_keyboard())
 
+    is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
+    if not is_member:
+        await message.answer(
+            "Поделитесь ботом с друзьями и зарабатывайте звезды!",
+            reply_markup=subscribe_keyboard(settings.channel_username),
+        )
+    elif activated:
+        await message.answer("Спасибо за подписку! Теперь бот доступен полностью.")
+
     bot_info = await bot.get_me()
-    await message.answer(
-        "Поделитесь ботом с друзьями и зарабатывайте звезды!",
-        reply_markup=subscribe_keyboard(settings.channel_username),
-    )
     await message.answer(
         "Ваша персональная ссылка: https://t.me/{username}?start=ref{tg_id}".format(
             username=bot_info.username,
