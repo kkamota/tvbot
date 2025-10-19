@@ -120,9 +120,12 @@ class Database:
         )
 
     async def mark_reward_claimed(self, telegram_id: int) -> None:
+        await self.set_reward_claimed(telegram_id, True)
+
+    async def set_reward_claimed(self, telegram_id: int, claimed: bool) -> None:
         await self._execute(
-            "UPDATE users SET reward_claimed = 1 WHERE telegram_id = ?",
-            (telegram_id,),
+            "UPDATE users SET reward_claimed = ? WHERE telegram_id = ?",
+            (int(claimed), telegram_id),
         )
 
     async def set_last_daily_bonus(self, telegram_id: int, timestamp: str | None) -> None:

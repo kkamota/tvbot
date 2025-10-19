@@ -132,11 +132,42 @@ async def _activate_subscription(user: User, bot: Bot, settings: Settings) -> No
             )
 
 
+async def _handle_unsubscription(user: User, bot: Bot, settings: Settings) -> None:
+    await db.set_subscription(user.telegram_id, False)
+    user.is_subscribed = False
+
+    if user.reward_claimed and user.referred_by:
+        await db.update_balance(user.telegram_id, -settings.referral_bonus)
+        await db.update_balance(user.referred_by, -settings.referral_bonus)
+        await db.set_reward_claimed(user.telegram_id, False)
+        user.reward_claimed = False
+
+        referral_name = f"@{user.username}" if user.username else f"ID {user.telegram_id}"
+        with suppress(TelegramBadRequest):
+            await bot.send_message(
+                user.referred_by,
+                (
+                    f"Ваш реферал {referral_name} отписался от канала. "
+                    f"С вашего баланса списано {settings.referral_bonus} ⭐."
+                ),
+            )
+        with suppress(TelegramBadRequest):
+            await bot.send_message(
+                user.telegram_id,
+                (
+                    "Мы заметили, что вы отписались от канала. "
+                    f"{settings.referral_bonus} ⭐ были списаны с вашего баланса и с баланса пригласившего вас пользователя."
+                ),
+            )
+
+
 async def _verify_and_activate_subscription(
     bot: Bot, settings: Settings, user: User
 ) -> tuple[bool, bool]:
     is_member = await _is_channel_member(bot, settings, user.telegram_id)
     if not is_member:
+        if user.is_subscribed:
+            await _handle_unsubscription(user, bot, settings)
         return False, False
     if not user.is_subscribed:
         await _activate_subscription(user, bot, settings)
