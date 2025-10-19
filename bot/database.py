@@ -20,6 +20,7 @@ class User:
     last_daily_bonus: Optional[str]
     username: Optional[str]
     is_banned: bool
+    start_bonus_claimed: bool
 
 
 @dataclass(slots=True)
@@ -53,6 +54,11 @@ class Database:
         )
         await self._ensure_column("users", "username", "TEXT")
         await self._ensure_column("users", "is_banned", "INTEGER NOT NULL DEFAULT 0")
+        await self._ensure_column(
+            "users",
+            "start_bonus_claimed",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals (
@@ -67,7 +73,7 @@ class Database:
 
     async def get_user(self, telegram_id: int) -> Optional[User]:
         row = await self._fetchone(
-            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username, is_banned FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, balance, referred_by, is_subscribed, reward_claimed, last_daily_bonus, username, is_banned, start_bonus_claimed FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if row is None:
@@ -81,6 +87,7 @@ class Database:
             last_daily_bonus=row[5],
             username=row[6],
             is_banned=bool(row[7]),
+            start_bonus_claimed=bool(row[8]),
         )
 
     async def create_user(
@@ -91,8 +98,23 @@ class Database:
         username: Optional[str],
     ) -> None:
         await self._execute(
-            "INSERT OR IGNORE INTO users (telegram_id, balance, referred_by, username) VALUES (?, ?, ?, ?)",
-            (telegram_id, initial_balance, referred_by, username),
+            """
+            INSERT OR IGNORE INTO users (
+                telegram_id,
+                balance,
+                referred_by,
+                username,
+                start_bonus_claimed
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                initial_balance,
+                referred_by,
+                username,
+                int(initial_balance > 0),
+            ),
         )
 
     async def assign_referrer(self, telegram_id: int, referred_by: Optional[int]) -> None:
@@ -125,6 +147,12 @@ class Database:
     async def set_reward_claimed(self, telegram_id: int, claimed: bool) -> None:
         await self._execute(
             "UPDATE users SET reward_claimed = ? WHERE telegram_id = ?",
+            (int(claimed), telegram_id),
+        )
+
+    async def set_start_bonus_claimed(self, telegram_id: int, claimed: bool) -> None:
+        await self._execute(
+            "UPDATE users SET start_bonus_claimed = ? WHERE telegram_id = ?",
             (int(claimed), telegram_id),
         )
 

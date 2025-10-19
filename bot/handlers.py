@@ -51,7 +51,7 @@ async def _ensure_user_record(
     user = await db.get_user(telegram_id)
     created = False
     if user is None:
-        await db.create_user(telegram_id, settings.start_bonus, referred_by, username)
+        await db.create_user(telegram_id, 0, referred_by, username)
         user = await db.get_user(telegram_id)
         created = True
     elif referred_by and user.referred_by is None and referred_by != telegram_id:
@@ -113,9 +113,17 @@ async def _is_channel_member(bot: Bot, settings: Settings, telegram_id: int) -> 
     }
 
 
-async def _activate_subscription(user: User, bot: Bot, settings: Settings) -> None:
+async def _activate_subscription(
+    user: User, bot: Bot, settings: Settings
+) -> bool:
     await db.set_subscription(user.telegram_id, True)
     user.is_subscribed = True
+    start_bonus_awarded = False
+    if not user.start_bonus_claimed:
+        await db.update_balance(user.telegram_id, settings.start_bonus)
+        await db.set_start_bonus_claimed(user.telegram_id, True)
+        user.start_bonus_claimed = True
+        start_bonus_awarded = True
     if user.referred_by and not user.reward_claimed:
         await db.update_balance(user.referred_by, settings.referral_bonus)
         await db.mark_reward_claimed(user.telegram_id)
@@ -130,6 +138,8 @@ async def _activate_subscription(user: User, bot: Bot, settings: Settings) -> No
                     f"Вам начислено {settings.referral_bonus} ⭐."
                 ),
             )
+
+    return start_bonus_awarded
 
 
 async def _handle_unsubscription(user: User, bot: Bot, settings: Settings) -> None:
@@ -163,22 +173,24 @@ async def _handle_unsubscription(user: User, bot: Bot, settings: Settings) -> No
 
 async def _verify_and_activate_subscription(
     bot: Bot, settings: Settings, user: User
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     is_member = await _is_channel_member(bot, settings, user.telegram_id)
     if not is_member:
         if user.is_subscribed:
             await _handle_unsubscription(user, bot, settings)
-        return False, False
+        return False, False, False
     if not user.is_subscribed:
-        await _activate_subscription(user, bot, settings)
-        return True, True
-    return True, False
+        start_bonus_awarded = await _activate_subscription(user, bot, settings)
+        return True, True, start_bonus_awarded
+    return True, False, False
 
 
 async def ensure_subscription_access(
     message: Message, bot: Bot, settings: Settings, user: User
 ) -> bool:
-    is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
+    is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
+        bot, settings, user
+    )
     if not is_member:
         await message.answer(
             "Бот доступен только после подписки на канал.",
@@ -186,7 +198,10 @@ async def ensure_subscription_access(
         )
         return False
     if activated:
-        await message.answer("Спасибо за подписку! Теперь бот доступен полностью.")
+        thanks_message = "Спасибо за подписку! Теперь бот доступен полностью."
+        if start_bonus_awarded:
+            thanks_message += f" Вам начислено {settings.start_bonus} ⭐ стартового бонуса."
+        await message.answer(thanks_message)
     return True
 
 
@@ -214,20 +229,28 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
         return
     if created:
         await message.answer(
-            "Добро пожаловать! На ваш баланс начислено 3 ⭐ за регистрацию.",
+            (
+                "Добро пожаловать! Подпишитесь на наш канал, чтобы получить "
+                f"стартовый бонус {settings.start_bonus} ⭐."
+            ),
             reply_markup=main_menu_keyboard(),
         )
     else:
         await message.answer("С возвращением!", reply_markup=main_menu_keyboard())
 
-    is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
+    is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
+        bot, settings, user
+    )
     if not is_member:
         await message.answer(
             "Поделитесь ботом с друзьями и зарабатывайте звезды!",
             reply_markup=subscribe_keyboard(settings.channel_username),
         )
     elif activated:
-        await message.answer("Спасибо за подписку! Теперь бот доступен полностью.")
+        message_text = "Спасибо за подписку! Теперь бот доступен полностью."
+        if start_bonus_awarded:
+            message_text += f" Вам начислено {settings.start_bonus} ⭐ стартового бонуса."
+        await message.answer(message_text)
 
     bot_info = await bot.get_me()
     await message.answer(
@@ -315,7 +338,9 @@ async def check_subscription(message: Message, bot: Bot, settings: Settings) -> 
     user = await ensure_user(message, settings)
     if not await ensure_not_banned(message, user):
         return
-    is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
+    is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
+        bot, settings, user
+    )
     if not is_member:
         await message.answer(
             "Пожалуйста, подпишитесь на канал, чтобы получать награды.",
@@ -325,6 +350,8 @@ async def check_subscription(message: Message, bot: Bot, settings: Settings) -> 
 
     if activated:
         response = "Спасибо за подписку! Награды активированы."
+        if start_bonus_awarded:
+            response += f" Вам начислено {settings.start_bonus} ⭐ стартового бонуса."
         if user.referred_by and user.reward_claimed:
             response += f" Вашему другу начислено {settings.referral_bonus} ⭐ за приглашение."
         await message.answer(response)
@@ -348,7 +375,9 @@ async def check_subscription_callback(
                 "Ваш аккаунт заблокирован. Свяжитесь с поддержкой для разблокировки."
             )
         return
-    is_member, activated = await _verify_and_activate_subscription(bot, settings, user)
+    is_member, activated, start_bonus_awarded = await _verify_and_activate_subscription(
+        bot, settings, user
+    )
     if not is_member:
         await callback.answer(
             "Подпишитесь на канал, чтобы продолжить.",
@@ -362,6 +391,8 @@ async def check_subscription_callback(
 
     if activated:
         response = "Спасибо за подписку! Награды активированы."
+        if start_bonus_awarded:
+            response += f" Вам начислено {settings.start_bonus} ⭐ стартового бонуса."
         if user.referred_by and user.reward_claimed:
             response += f" Вашему другу начислено {settings.referral_bonus} ⭐ за приглашение."
     else:
